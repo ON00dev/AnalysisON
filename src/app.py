@@ -4,16 +4,22 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from fbprophet import Prophet
+from prophet import Prophet
 import requests
 import time
 
 
 class TradeAnalyzer:
-    def __init__(self, symbol, api_key, interval='1min', db_path='trade_data.db', model=None, cache_duration=60):
+    def __init__(self, symbol, api_key, interval='1min', take_profit=None, stop_loss=None, leverage=None, volume=None,
+                 desired_risk_reward_ratio=2.0, db_path='trade_data.db', model=None, cache_duration=60):
         self.symbol = symbol
         self.api_key = api_key
         self.interval = interval
+        self.take_profit = take_profit
+        self.stop_loss = stop_loss
+        self.leverage = leverage
+        self.volume = volume
+        self.desired_risk_reward_ratio = desired_risk_reward_ratio
         self.db_path = db_path
         self.model = model
         self.cache_duration = cache_duration  # duração do cache em segundos
@@ -169,15 +175,15 @@ class TradeAnalyzer:
                 return cached_price
 
         # Fazer chamada à API se cache estiver expirado ou não existir
-        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={self.symbol}&interval={self.interval}&apikey={self.api_key}'
+        url = f'https://www.alphavantage.co/query?function=CRYPTO_INTRADAY&symbol={self.symbol}&market=USD&interval={self.interval}&apikey={self.api_key}'
         response = requests.get(url)
         data = response.json()
 
-        if 'Time Series (' + self.interval + ')' not in data:
+        if 'Time Series Crypto (' + self.interval + ')' not in data:
             raise ValueError("Erro ao obter os dados da API. Verifique o símbolo e a chave API.")
 
-        latest_timestamp = list(data['Time Series (' + self.interval + ')'].keys())[0]
-        latest_price = float(data['Time Series (' + self.interval + ')'][latest_timestamp]['4. close'])
+        latest_timestamp = list(data['Time Series Crypto (' + self.interval + ')'].keys())[0]
+        latest_price = float(data['Time Series Crypto (' + self.interval + ')'][latest_timestamp]['4. close'])
 
         # Armazenar no cache
         conn = sqlite3.connect(self.db_path)
@@ -191,24 +197,35 @@ class TradeAnalyzer:
 
         return latest_price
 
-    def analyze_trade(self, take_profit, stop_loss, volume, leverage, desired_risk_reward_ratio=2.0):
+    def analyze_trade(self):
         # Atualiza o preço de entrada com o preço mais recente
         entry_price = self.fetch_latest_price()
 
-        risk = self.calculate_risk(entry_price, stop_loss, volume, leverage)
-        reward = self.calculate_reward(entry_price, take_profit, volume, leverage)
-        ratio = self.risk_reward_ratio(entry_price, take_profit, stop_loss, volume, leverage)
+        # Caso o usuário não tenha definido volume ou outros parâmetros, definir valores padrão ou calcular
+        if self.volume is None:
+            self.volume = 100  # Exemplo de valor padrão para volume
+        if self.take_profit is None or self.stop_loss is None or self.leverage is None:
+            # Calcular ou sugerir valores padrões para take_profit, stop_loss e leverage
+            self.take_profit = entry_price * 1.02 if self.take_profit is None else self.take_profit
+            self.stop_loss = entry_price * 0.98 if self.stop_loss is None else self.stop_loss
+            self.leverage = 10 if self.leverage is None else self.leverage
+
+        risk = self.calculate_risk(entry_price, self.stop_loss, self.volume, self.leverage)
+        reward = self.calculate_reward(entry_price, self.take_profit, self.volume, self.leverage)
+        ratio = self.risk_reward_ratio(entry_price, self.take_profit, self.stop_loss, self.volume, self.leverage)
         suggestion = self.suggested_trade(ratio)
 
-        new_take_profit, new_stop_loss = self.optimize_take_profit_stop_loss(entry_price, stop_loss, volume, leverage,
-                                                                             desired_risk_reward_ratio)
-        trade_success_probability = self.predict_trade_success(entry_price, take_profit, stop_loss, volume, leverage)
+        new_take_profit, new_stop_loss = self.optimize_take_profit_stop_loss(entry_price, self.stop_loss, self.volume,
+                                                                             self.leverage,
+                                                                             self.desired_risk_reward_ratio)
+        trade_success_probability = self.predict_trade_success(entry_price, self.take_profit, self.stop_loss,
+                                                               self.volume, self.leverage)
 
         # Atualizar o modelo
         self.update_model()
 
         # Salvar o trade na base de dados (assumindo sucesso ou falha manualmente por agora)
-        self.save_trade(entry_price, take_profit, stop_loss, volume, leverage,
+        self.save_trade(entry_price, self.take_profit, self.stop_loss, self.volume, self.leverage,
                         success=1 if trade_success_probability > 0.5 else 0)
 
         analysis = {
@@ -229,18 +246,25 @@ class TradeAnalyzer:
         return analysis
 
 
-# Exemplo de uso com IA, persistência de dados e integração com API
-symbol = "AAPL"  # Símbolo da ação ou criptomoeda (exemplo: AAPL para Apple)
-api_key = "2HK5QJ9BUX4WSFI7"  # Chave API fornecida
-interval = "5min"  # Intervalo de tempo desejado para os dados
+# Exemplo de uso com parâmetros do usuário
+symbol = input("Digite o símbolo da criptomoeda (ex: BTC): ").upper()
+api_key = input("Digite sua chave da API Alpha Vantage: ")
+interval = input("Escolha o intervalo de tempo (ex: 1min, 5min, 15min): ")
+take_profit = float(input("Digite o valor de take_profit (ou deixe em branco para IA decidir): ") or 0)
+stop_loss = float(input("Digite o valor de stop_loss (ou deixe em branco para IA decidir): ") or 0)
+leverage = float(input("Digite o valor de leverage (ou deixe em branco para IA decidir): ") or 0)
+volume = float(input("Digite o valor de volume (ou deixe em branco para IA decidir): ") or 0)
+desired_risk_reward_ratio = float(input("Digite o valor desejado de relação risco/recompensa (default é 2.0): ") or 2.0)
 
-take_profit = 2747.54
-stop_loss = 2716.64
-volume = 115.63116
-leverage = 40
+# Configurações dos parâmetros de trading
+take_profit = None if take_profit == 0 else take_profit
+stop_loss = None if stop_loss == 0 else stop_loss
+leverage = None if leverage == 0 else leverage
+volume = None if volume == 0 else volume
 
-analyzer = TradeAnalyzer(symbol, api_key, interval=interval)
-analysis = analyzer.analyze_trade(take_profit, stop_loss, volume, leverage, desired_risk_reward_ratio=2.0)
+analyzer = TradeAnalyzer(symbol, api_key, interval=interval, take_profit=take_profit, stop_loss=stop_loss,
+                         leverage=leverage, volume=volume, desired_risk_reward_ratio=desired_risk_reward_ratio)
+analysis = analyzer.analyze_trade()
 
 for key, value in analysis.items():
     if key == "Previsão de Preços Futuros":
