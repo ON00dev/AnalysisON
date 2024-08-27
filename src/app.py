@@ -7,14 +7,16 @@ from sklearn.preprocessing import StandardScaler
 from prophet import Prophet
 import requests
 import time
+from datetime import datetime
+from colorama import Fore, Style, init
 
+# Inicializa o colorama
+init(autoreset=True)
 
 class TradeAnalyzer:
-    def __init__(self, symbol, api_key, interval='1min', take_profit=None, stop_loss=None, leverage=None, volume=None,
+    def __init__(self, symbol, take_profit=None, stop_loss=None, leverage=None, volume=None,
                  desired_risk_reward_ratio=2.0, db_path='trade_data.db', model=None, cache_duration=60):
         self.symbol = symbol
-        self.api_key = api_key
-        self.interval = interval
         self.take_profit = take_profit
         self.stop_loss = stop_loss
         self.leverage = leverage
@@ -43,7 +45,6 @@ class TradeAnalyzer:
         c.execute('''
             CREATE TABLE IF NOT EXISTS price_cache (
                 symbol TEXT,
-                interval TEXT,
                 timestamp TEXT,
                 price REAL,
                 fetched_at REAL
@@ -77,9 +78,9 @@ class TradeAnalyzer:
 
     def suggested_trade(self, ratio):
         if ratio is None or ratio <= 1:
-            return "Negativo: A relação risco/recompensa é desfavorável."
+            return f"{Fore.RED}Negativo: A relação risco/recompensa é desfavorável."
         else:
-            return "Positivo: A relação risco/recompensa é favorável."
+            return f"{Fore.GREEN}Positivo: A relação risco/recompensa é favorável."
 
     def optimize_take_profit_stop_loss(self, entry_price, stop_loss, volume, leverage, desired_risk_reward_ratio):
         risk = self.calculate_risk(entry_price, stop_loss, volume, leverage)
@@ -89,12 +90,12 @@ class TradeAnalyzer:
 
     def predict_trade_success(self, entry_price, take_profit, stop_loss, volume, leverage):
         if self.model is None:
-            return "Modelo não fornecido para previsão."
+            return None  # Retorna None se o modelo não estiver disponível
 
         features = np.array([[entry_price, take_profit, stop_loss, volume, leverage]])
         features_scaled = self.model['scaler'].transform(features)
         probability = self.model['classifier'].predict_proba(features_scaled)[0][1]
-        return probability
+        return float(probability)  # Garantindo que o valor retornado é um float
 
     def update_model(self):
         conn = sqlite3.connect(self.db_path)
@@ -103,17 +104,34 @@ class TradeAnalyzer:
         data = c.fetchall()
         conn.close()
 
-        if len(data) == 0:
+        if len(data) < 2:
+            print(f"{Fore.YELLOW}Dados insuficientes para treinar o modelo. O modelo não será atualizado.")
             return
 
         data = np.array(data)
         X = data[:, :-1]
         y = data[:, -1]
 
+        # Verifica se há pelo menos duas classes diferentes em y
+        unique_classes = np.unique(y)
+        if len(unique_classes) < 2:
+            print(
+                f"{Fore.YELLOW}Dados insuficientes para treinar o modelo: apenas uma classe presente. O modelo não será atualizado.")
+            return
+
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+        test_size = 0.2
+        if len(X_scaled) == 2:
+            test_size = 0.5  # Para garantir que haja pelo menos uma amostra em cada conjunto
+
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=42)
+
+        if len(X_train) == 0 or len(X_test) == 0:
+            print(
+                f"{Fore.YELLOW}Não há dados suficientes para treinar ou testar o modelo. O modelo não será atualizado.")
+            return
 
         model = LogisticRegression()
         model.fit(X_train, y_train)
@@ -122,6 +140,7 @@ class TradeAnalyzer:
             'classifier': model,
             'scaler': scaler
         }
+        print(f"{Fore.GREEN}Modelo atualizado com sucesso.")
 
     def forecast_price(self, periods=30):
         conn = sqlite3.connect(self.db_path)
@@ -130,14 +149,19 @@ class TradeAnalyzer:
         data = c.fetchall()
         conn.close()
 
-        if len(data) == 0:
-            return None
+        if len(data) < 2:
+            raise ValueError("Não há dados suficientes para realizar a previsão de preços.")
 
         df = pd.DataFrame(data, columns=['ds', 'y'])
         df['ds'] = pd.to_datetime(df['ds'], unit='D')
 
         model = Prophet()
-        model.fit(df)
+
+        try:
+            model.fit(df)
+        except ValueError as e:
+            print(f"Erro ao ajustar o modelo: {e}")
+            return None
 
         future = model.make_future_dataframe(periods=periods)
         forecast = model.predict(future)
@@ -145,7 +169,6 @@ class TradeAnalyzer:
         return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
 
     def clean_cache(self):
-        # Remove dados do cache que expiraram
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute('''
@@ -155,17 +178,15 @@ class TradeAnalyzer:
         conn.close()
 
     def fetch_latest_price(self):
-        # Primeiro, limpar o cache expirado
         self.clean_cache()
 
-        # Verificar cache antes de fazer a chamada à API
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute('''
             SELECT price, fetched_at FROM price_cache 
-            WHERE symbol = ? AND interval = ? 
+            WHERE symbol = ? 
             ORDER BY fetched_at DESC LIMIT 1
-        ''', (self.symbol, self.interval))
+        ''', (self.symbol,))
         row = c.fetchone()
         conn.close()
 
@@ -174,38 +195,35 @@ class TradeAnalyzer:
             if time.time() - fetched_at < self.cache_duration:
                 return cached_price
 
-        # Fazer chamada à API se cache estiver expirado ou não existir
-        url = f'https://www.alphavantage.co/query?function=CRYPTO_INTRADAY&symbol={self.symbol}&market=USD&interval={self.interval}&apikey={self.api_key}'
+        # Usando API da Binance para obter dados em tempo real
+        url = f'https://api.binance.com/api/v3/ticker/price?symbol={self.symbol}USDT'
         response = requests.get(url)
         data = response.json()
 
-        if 'Time Series Crypto (' + self.interval + ')' not in data:
-            raise ValueError("Erro ao obter os dados da API. Verifique o símbolo e a chave API.")
+        if 'price' not in data:
+            raise ValueError(f"{Fore.RED}Erro ao obter os dados da API da Binance. Verifique o símbolo da criptomoeda.")
 
-        latest_timestamp = list(data['Time Series Crypto (' + self.interval + ')'].keys())[0]
-        latest_price = float(data['Time Series Crypto (' + self.interval + ')'][latest_timestamp]['4. close'])
+        latest_price = float(data['price'])
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # Armazenar no cache
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute('''
-            INSERT INTO price_cache (symbol, interval, timestamp, price, fetched_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (self.symbol, self.interval, latest_timestamp, latest_price, time.time()))
+            INSERT INTO price_cache (symbol, timestamp, price, fetched_at)
+            VALUES (?, ?, ?, ?)
+        ''', (self.symbol, timestamp, latest_price, time.time()))
         conn.commit()
         conn.close()
 
         return latest_price
 
     def analyze_trade(self):
-        # Atualiza o preço de entrada com o preço mais recente
         entry_price = self.fetch_latest_price()
 
-        # Caso o usuário não tenha definido volume ou outros parâmetros, definir valores padrão ou calcular
         if self.volume is None:
-            self.volume = 100  # Exemplo de valor padrão para volume
+            self.volume = 100
         if self.take_profit is None or self.stop_loss is None or self.leverage is None:
-            # Calcular ou sugerir valores padrões para take_profit, stop_loss e leverage
             self.take_profit = entry_price * 1.02 if self.take_profit is None else self.take_profit
             self.stop_loss = entry_price * 0.98 if self.stop_loss is None else self.stop_loss
             self.leverage = 10 if self.leverage is None else self.leverage
@@ -221,12 +239,15 @@ class TradeAnalyzer:
         trade_success_probability = self.predict_trade_success(entry_price, self.take_profit, self.stop_loss,
                                                                self.volume, self.leverage)
 
-        # Atualizar o modelo
+        if trade_success_probability is None:
+            success = 0
+            print(f"{Fore.YELLOW}Aviso: Modelo não fornecido para previsão. Definindo 'success' como 0.")
+        else:
+            success = 1 if trade_success_probability > 0.5 else 0
+
         self.update_model()
 
-        # Salvar o trade na base de dados (assumindo sucesso ou falha manualmente por agora)
-        self.save_trade(entry_price, self.take_profit, self.stop_loss, self.volume, self.leverage,
-                        success=1 if trade_success_probability > 0.5 else 0)
+        self.save_trade(entry_price, self.take_profit, self.stop_loss, self.volume, self.leverage, success=success)
 
         analysis = {
             "Preço de Entrada Atualizado": entry_price,
@@ -239,31 +260,30 @@ class TradeAnalyzer:
             "Probabilidade de Sucesso do Trade (IA)": trade_success_probability
         }
 
-        # Previsão de preços futuros
         price_forecast = self.forecast_price()
-        analysis["Previsão de Preços Futuros"] = price_forecast
+        if price_forecast is not None:
+            analysis["Previsão de Preços Futuros"] = price_forecast
+        else:
+            analysis["Previsão de Preços Futuros"] = f"{Fore.YELLOW}Previsão não disponível devido à falta de dados."
 
         return analysis
 
 
 # Exemplo de uso com parâmetros do usuário
 symbol = input("Digite o símbolo da criptomoeda (ex: BTC): ").upper()
-api_key = input("Digite sua chave da API Alpha Vantage: ")
-interval = input("Escolha o intervalo de tempo (ex: 1min, 5min, 15min): ")
 take_profit = float(input("Digite o valor de take_profit (ou deixe em branco para IA decidir): ") or 0)
 stop_loss = float(input("Digite o valor de stop_loss (ou deixe em branco para IA decidir): ") or 0)
 leverage = float(input("Digite o valor de leverage (ou deixe em branco para IA decidir): ") or 0)
 volume = float(input("Digite o valor de volume (ou deixe em branco para IA decidir): ") or 0)
 desired_risk_reward_ratio = float(input("Digite o valor desejado de relação risco/recompensa (default é 2.0): ") or 2.0)
 
-# Configurações dos parâmetros de trading
 take_profit = None if take_profit == 0 else take_profit
 stop_loss = None if stop_loss == 0 else stop_loss
 leverage = None if leverage == 0 else leverage
 volume = None if volume == 0 else volume
 
-analyzer = TradeAnalyzer(symbol, api_key, interval=interval, take_profit=take_profit, stop_loss=stop_loss,
-                         leverage=leverage, volume=volume, desired_risk_reward_ratio=desired_risk_reward_ratio)
+analyzer = TradeAnalyzer(symbol, take_profit=take_profit, stop_loss=stop_loss, leverage=leverage,
+                         volume=volume, desired_risk_reward_ratio=desired_risk_reward_ratio)
 analysis = analyzer.analyze_trade()
 
 for key, value in analysis.items():
